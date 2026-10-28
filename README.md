@@ -76,3 +76,32 @@ static/        browser UI
 - Faster/optional translation backend
 - Floating always-on-top caption overlay
 - Cross-platform loopback parity
+
+## Third-party components & attributions
+This project is built on, and depends on, the following third-party components. All are
+permissively licensed (MIT and/or Apache-2.0) and compatible with the Apache-2.0 project license.
+
+**Machine-learning models** (downloaded to the local model cache on first run; not bundled in
+this repository):
+
+| Component | Used for | License |
+|-----------|----------|---------|
+| [Whisper](https://github.com/openai/whisper) (OpenAI) | speech-to-text | MIT |
+| [Phi-3-mini](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct) (Microsoft) | translation | MIT |
+
+**Core libraries:**
+
+| Crate | License |
+|-------|---------|
+| [kalosm](https://github.com/LostDok/kalosm) | MIT / Apache-2.0 |
+| [cpal](https://github.com/RustAudio/cpal) | Apache-2.0 |
+| [axum](https://github.com/tokio-rs/axum), [tokio](https://github.com/tokio-rs/tokio), [tower-http](https://github.com/tower-rs/tower-http) | MIT |
+| [ort](https://github.com/pykeio/ort), [candle](https://github.com/huggingface/candle), [tokenizers](https://github.com/huggingface/tokenizers) | MIT and/or Apache-2.0 |
+| [rodio](https://github.com/RustAudio/rodio) | MIT / Apache-2.0 |
+
+All other transitive dependencies are likewise MIT and/or Apache-2.0. To regenerate a full,
+exact list of every crate and license, run `cargo install cargo-about` and generate a notice file.
+
+## License
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
+Copyright 2026 PeterYuen.
