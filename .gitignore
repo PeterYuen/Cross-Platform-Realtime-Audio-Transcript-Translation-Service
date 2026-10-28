@@ -1,0 +1,9 @@
+/target
+/models
+*.log
+/build*.txt
+/build*.err
+/build*.log
+/stdout.txt
+/stderr.txt
+/server_*.log

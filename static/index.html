@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Realtime Audio Translator</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Realtime Audio Translator</h1>
+            <div class="status-indicator">
+                <span id="status-dot" class="dot"></span>
+                <span id="status-text">Stopped</span>
+            </div>
+        </header>
+
+        <section class="controls">
+            <div class="control-group">
+                <label for="audio-device">Audio Source</label>
+                <select id="audio-device">
+                    <option value="" data-loopback="true">🔊 Default system audio (loopback)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="target-language">Target Language</label>
+                <select id="target-language">
+                    <option value="English">English</option>
+                    <option value="Chinese (Simplified)">Chinese (Simplified)</option>
+                    <option value="Chinese (Traditional)">Chinese (Traditional)</option>
+                    <option value="Japanese">Japanese</option>
+                    <option value="Korean">Korean</option>
+                    <option value="Spanish">Spanish</option>
+                    <option value="French">French</option>
+                    <option value="German">German</option>
+                    <option value="Portuguese">Portuguese</option>
+                    <option value="Russian">Russian</option>
+                    <option value="Arabic">Arabic</option>
+                    <option value="Hindi">Hindi</option>
+                    <option value="Thai">Thai</option>
+                    <option value="Vietnamese">Vietnamese</option>
+                    <option value="Italian">Italian</option>
+                    <option value="Dutch">Dutch</option>
+                    <option value="Turkish">Turkish</option>
+                    <option value="Polish">Polish</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="whisper-model">Speech Recognition Model</label>
+                <select id="whisper-model">
+                    <option value="tiny_q">Fastest — Tiny (quantized)</option>
+                    <option value="base" selected>Fast — Base (default)</option>
+                    <option value="small">Balanced — Small</option>
+                    <option value="medium">Quality — Medium</option>
+                    <option value="large_v2">Best — Large v2</option>
+                    <option value="large_q">Best — Large v3 Turbo (quantized)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <button id="btn-start" class="btn btn-start">Start</button>
+                <button id="btn-stop" class="btn btn-stop" disabled>Stop</button>
+                <button id="btn-apply" class="btn btn-apply">Apply</button>
+                <span id="config-hint" class="hint"></span>
+            </div>
+        </section>
+
+        <section class="meter-row">
+            <span class="meter-label">Input level</span>
+            <div class="meter"><div id="level-bar" class="level-bar"></div></div>
+            <span id="level-value" class="level-value">0.000</span>
+        </section>
+
+        <div id="error-banner" class="error-banner" hidden></div>
+
+        <section class="output">
+            <div class="output-panel">
+                <h3>Transcript</h3>
+                <div id="transcript" class="output-content"></div>
+            </div>
+            <div class="output-panel">
+                <h3>Translation</h3>
+                <div id="translation" class="output-content"></div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
