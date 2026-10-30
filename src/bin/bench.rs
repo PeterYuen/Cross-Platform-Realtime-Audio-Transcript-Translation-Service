@@ -38,7 +38,7 @@ fn read_wav_mono_16k(path: &str) -> (Vec<f32>, f32) {
         let i0 = pos.floor() as usize;
         let i1 = (i0 + 1).min(mono.len() - 1);
         let f = pos - i0 as f32;
-        out.push((mono[i0] as f32) * (1.0 - f as f32) + (mono[i1] as f32) * f as f32);
+        out.push(mono[i0] * (1.0 - f) + mono[i1] * f);
     }
     let dur = n_out as f32 / target;
     (out, dur)
@@ -434,7 +434,7 @@ fn main() -> anyhow::Result<()> {
             while s.next().await.is_some() {
                 n += 1;
                 let now = t.elapsed();
-                if n <= 3 || n % 10 == 0 {
+                if n <= 3 || n.is_multiple_of(10) {
                     println!(
                         "POS token#{:<3} since_start={:>6.2}s delta={:>5.2}s",
                         n,

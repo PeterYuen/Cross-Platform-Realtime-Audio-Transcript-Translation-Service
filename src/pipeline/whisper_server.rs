@@ -166,7 +166,7 @@ impl WhisperServer {
             .unwrap_or("")
             .to_string();
         if got.trim().is_empty() {
-            println!(
+            tracing::warn!(
                 "whisper-server empty (samples={}, resp={:?})",
                 samples.len(),
                 &text[..text.len().min(160)]

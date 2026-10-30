@@ -4042,7 +4042,6 @@ dependencies = [
  "axum",
  "cpal",
  "dirs-next",
- "futures",
  "futures-util",
  "hound",
  "kalosm",

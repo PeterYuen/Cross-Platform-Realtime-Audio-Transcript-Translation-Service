@@ -266,6 +266,7 @@ impl TranslateEngine {
 /// - the previous non-Chinese branch embedded a *Spanish* example sentence, so translating to
 ///   Korean or German produced output sprinkled with Spanish/Portuguese-looking fragments. That
 ///   single line is the main reason reviewers saw six languages in one transcript.
+///
 /// Terms that apply to this target language, formatted for the prompt.
 fn glossary_lines(target_language: &str, glossary: &[GlossaryTerm], text: &str) -> String {
     let lowered = text.to_lowercase();
@@ -633,7 +634,7 @@ fn strip_commentary(s: &str) -> String {
             cut = cut.min(i);
         }
     }
-    let cleaned = drop_meta_sentences(&s[..cut].trim().to_string());
+    let cleaned = drop_meta_sentences(s[..cut].trim());
     if cleaned.is_empty() {
         return split_after_lead_in(&s[..cut]);
     }
