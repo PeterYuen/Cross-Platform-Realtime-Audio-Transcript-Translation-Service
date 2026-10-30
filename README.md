@@ -35,6 +35,52 @@ Open **http://localhost:3000**, pick a loopback output device, choose language +
 then **Start**. First launch downloads models (Whisper GGUFs + the Qwen instruct GGUF) into
 `%APPDATA%\kalosm\cache`; the `HF_HOME` cache set by `main.rs` is `%LOCALAPPDATA%\realtime-translator\models`.
 
+### Run it locally
+
+The binary starts either way, but with nothing configured it quietly runs the candle fallback and
+every number in [Performance](#performance) is 20-40x worse. Two things it cannot detect for you:
+
+1. **Both server binaries must be reachable** — see
+   [Third-party binaries](#third-party-binaries). A healthy server already listening on 9183/8183 is
+   *adopted* rather than restarted, so leftover processes get reused.
+2. **The weights you want must be pinned.** When whisper.cpp is active, `whisper_model` is ignored
+   (it selects the candle model only); the weights come from `stt.model`. Auto-discovery ranks
+   `tiny` ahead of `base`, so name the file explicitly if you want base or small.
+
+```toml
+[stt]
+server = "C:\\whisper.cpp\\build\\bin\\whisper-server.exe"
+model  = "C:\\whisper.cpp\\models\\ggml-base.bin"   # tiny wins discovery unless pinned
+
+[translation]
+llama_server = "C:\\llama.cpp\\build\\bin\\llama-server.exe"
+```
+
+Then run **from the repo root** — `static/app.js` and `static/style.css` are served from disk, so
+the wrong working directory looks exactly like a broken UI change:
+
+```powershell
+$env:RUST_LOG = "info"
+target\release\realtime-translator.exe
+```
+
+Read the first log lines: `stt backend: whisper.cpp` and `translation backend: llama.cpp` mean you
+are on the fast path. Anything that says candle means that backend was not found.
+
+#### Verify without a microphone
+
+Live WASAPI loopback can go silent without raising an error, so "no captions appeared" is not
+evidence of a bug. Drive the real VAD + STT + translation path from a clip instead:
+
+```powershell
+$env:RT_TEST_WAV = "C:\path\to\clip.wav"    # 16 kHz mono; bench exits 2 if unset
+cargo run --release --bin bench -- lat
+```
+
+Modes are `stt | lat | win | halluc | sess | pos | raw`, and `lat` is the end-to-end gate. Pass =
+non-empty transcripts *and* translations, no `STREAM contained ... foreign-script chars`, and a
+backlog that does not grow without bound.
+
 ### Building without Visual Studio (x86_64-pc-windows-gnu)
 
 The `stable-x86_64-pc-windows-gnu` toolchain works and needs no MSVC, but two things are required:
@@ -71,7 +117,7 @@ Persisted at `%APPDATA%\realtime-translator\config.toml`:
 |-----|---------|
 | `audio_device_name` / `audio_device_is_loopback` | capture source |
 | `target_language` | translation target |
-| `whisper_model` | `tiny_q`, `base`, `small`, `medium`, `large_v2`, `large_q` |
+| `whisper_model` | candle STT weights: `tiny_q`, `base`, `small`, `medium`, `large_v2`, `large_q`. Ignored when whisper.cpp is active — use `stt.model` |
 | `vad_threshold`, `vad_hangover_frames`, `max_chunk_seconds` | segmentation tuning |
 | `translation.engine` | `auto` (default), `llama`, or `candle` |
 | `stt.engine` | `auto` (default), `whisper` (whisper.cpp), or `candle` |
@@ -177,7 +223,15 @@ Translation is decoupled so it never blocks capture/transcription.
   which no glossary can repair because the term never reaches it. `stt.model = ggml-base.bin` fixes
   most of that at roughly 4x the cost.
 - Live WASAPI loopback capture can go silent without raising an error; the watchdog reports it, but
-  the underlying cause is environmental.
+  the underlying cause is environmental. If `/api/debug/audio` shows `frames` stuck at 0 while
+  `device_error` is false, nothing is being captured — re-check with `bench lat` before assuming a
+  latency bug.
+- **A pipeline stuck in `loading_models` is a load failure, not a hang.** The MinGW runtime DLLs
+  must sit next to `whisper-server.exe` / `llama-server.exe`; without them Windows refuses the load
+  before the app can report anything.
+- **UI changes that do not appear:** `static/app.js` and `static/style.css` are served from disk and
+  take effect on reload (hard-refresh, a stale `app.js` looks identical to a broken change), but
+  `static/index.html` is compiled into the binary and needs a rebuild.
 
 ## Performance
 
