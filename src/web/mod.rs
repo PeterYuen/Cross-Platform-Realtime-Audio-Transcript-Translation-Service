@@ -79,9 +79,38 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<crate::config::C
 
 async fn set_config(
     State(state): State<Arc<AppState>>,
-    Json(new_config): Json<crate::config::Config>,
+    Json(new_config): Json<serde_json::Value>,
 ) -> StatusCode {
-    *state.config.lock() = new_config.clone();
-    new_config.save();
-    StatusCode::OK
+    // Merge, don't replace. The browser only sends the fields it shows, and a stale tab (or a
+    // partial client) used to reset everything else to its own defaults — that is how
+    // max_chunk_seconds kept snapping back to 5.0 behind our backs.
+    let mut merged = serde_json::to_value(&*state.config.lock())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    match (merged.as_object_mut(), new_config.as_object()) {
+        (Some(base), Some(incoming)) => {
+            for (k, v) in incoming {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        // Not an object: fall back to treating it as a whole config.
+        _ => match serde_json::from_value::<crate::config::Config>(new_config) {
+            Ok(cfg) => {
+                cfg.save();
+                *state.config.lock() = cfg;
+                return StatusCode::OK;
+            }
+            Err(_) => return StatusCode::BAD_REQUEST,
+        },
+    }
+    match serde_json::from_value::<crate::config::Config>(merged) {
+        Ok(cfg) => {
+            cfg.save();
+            *state.config.lock() = cfg;
+            StatusCode::OK
+        }
+        Err(e) => {
+            tracing::warn!("Rejected invalid config payload: {}", e);
+            StatusCode::BAD_REQUEST
+        }
+    }
 }

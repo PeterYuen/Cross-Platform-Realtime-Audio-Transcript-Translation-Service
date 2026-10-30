@@ -4044,6 +4044,7 @@ dependencies = [
  "dirs-next",
  "futures",
  "futures-util",
+ "hound",
  "kalosm",
  "parking_lot",
  "rodio",

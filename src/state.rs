@@ -23,6 +23,8 @@ pub struct AudioStats {
     pub transcribe_empty: AtomicU64,
     pub transcribe_errors: AtomicU64,
     pub translations: AtomicU64,
+    /// Captions that reached the translator but came back with no usable output.
+    pub empty_translations: AtomicU64,
 }
 
 impl AudioStats {
@@ -38,6 +40,8 @@ impl AudioStats {
             "transcribe_empty": self.transcribe_empty.load(Ordering::Relaxed),
             "transcribe_errors": self.transcribe_errors.load(Ordering::Relaxed),
             "translations": self.translations.load(Ordering::Relaxed),
+            "empty_translations": self.empty_translations.load(Ordering::Relaxed),
+
         })
     }
 
