@@ -22,7 +22,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     // Send current state on connect
     let init_msg = serde_json::to_string(&PipelineEvent::Status { running: state.is_running() }).unwrap();
-    if socket.send(axum::extract::ws::Message::Text(init_msg.into())).await.is_err() {
+    if socket.send(axum::extract::ws::Message::Text(init_msg)).await.is_err() {
         return;
     }
 
@@ -32,7 +32,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 match event {
                     Ok(event) => {
                         let msg = serde_json::to_string(&event).unwrap();
-                        if socket.send(axum::extract::ws::Message::Text(msg.into())).await.is_err() {
+                        if socket.send(axum::extract::ws::Message::Text(msg)).await.is_err() {
                             break;
                         }
                     }

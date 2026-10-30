@@ -4,6 +4,9 @@ use tracing::{debug, info};
 /// Buffers audio and emits chunks when speech is detected to end.
 pub struct Vad {
     threshold: f32,
+    /// Running estimate of the quietest level seen recently. Speech is detected relative to this
+    /// rather than to an absolute number, so a quiet loopback source is not silently ignored.
+    floor: f32,
     hangover_frames: usize,
     silence_count: usize,
     in_speech: bool,
@@ -15,6 +18,7 @@ impl Vad {
     pub fn new(threshold: f32, hangover_frames: usize, max_chunk_seconds: f32) -> Self {
         Self {
             threshold,
+            floor: 0.0,
             hangover_frames,
             silence_count: 0,
             in_speech: false,
@@ -26,7 +30,18 @@ impl Vad {
     /// Process a frame of audio samples. Returns Some(chunk) when a speech segment ends.
     pub fn process_frame(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
         let rms = compute_rms(samples);
-        let is_speech = rms > self.threshold;
+
+        // Min-tracking noise floor: falls instantly, creeps back up. Threshold then sits just
+        // above it, bounded so neither a silent room nor a loud one can disable detection.
+        if rms < self.floor {
+            self.floor = rms;
+        } else {
+            self.floor += (rms - self.floor) * 0.001;
+        }
+        let threshold = (self.floor * 3.0)
+            .max(self.threshold * 0.25)
+            .min(self.threshold * 4.0);
+        let is_speech = rms > threshold;
 
         if is_speech {
             self.silence_count = 0;
@@ -40,16 +55,32 @@ impl Vad {
             self.buffer.extend_from_slice(samples);
         }
 
-        // End of speech: hangover expired or max chunk reached
-        let should_emit = (self.in_speech && self.silence_count >= self.hangover_frames)
-            || self.buffer.len() >= self.max_chunk_samples;
-
-        if should_emit && !self.buffer.is_empty() {
+        // End of speech: hangover expired.
+        if self.in_speech && self.silence_count >= self.hangover_frames && !self.buffer.is_empty() {
             let chunk = std::mem::take(&mut self.buffer);
             self.in_speech = false;
             self.silence_count = 0;
             info!("VAD emitted chunk: {} samples ({:.2}s)", chunk.len(), chunk.len() as f32 / crate::audio::TARGET_SAMPLE_RATE as f32);
             return Some(chunk);
+        }
+
+        // The buffer is full but nobody has paused yet. Cutting anywhere inside a word makes
+        // Whisper-tiny invent the rest of it (measured: a 2 s window spanning a word boundary came
+        // out as "a lot of things is not real time" for audio that never said that). So split at
+        // the quietest boundary nearby and keep the tail for the next chunk.
+        if self.buffer.len() >= self.max_chunk_samples {
+            let split = quiet_split_point(&self.buffer, self.max_chunk_samples);
+            let chunk: Vec<f32> = self.buffer.drain(..split).collect();
+            self.silence_count = 0;
+            info!(
+                "VAD emitted chunk at quiet split: {} samples ({:.2}s, {:.2}s held back)",
+                chunk.len(),
+                chunk.len() as f32 / crate::audio::TARGET_SAMPLE_RATE as f32,
+                self.buffer.len() as f32 / crate::audio::TARGET_SAMPLE_RATE as f32
+            );
+            if !chunk.is_empty() {
+                return Some(chunk);
+            }
         }
 
         None
@@ -93,4 +124,27 @@ fn compute_rms(samples: &[f32]) -> f32 {
     }
     let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Pick a split point near `limit` that is least likely to fall inside a spoken word: the quietest
+/// frame boundary in the preceding ~0.6 s. Never returns a chunk shorter than ~0.5 s.
+fn quiet_split_point(buf: &[f32], limit: usize) -> usize {
+    const FRAME: usize = 160; // 10 ms at 16 kHz
+    let min_len = FRAME * 8;
+    let search = FRAME * 60;
+    let start = limit.saturating_sub(search).max(min_len);
+    let end = buf.len().min(limit + FRAME * 4);
+
+    let mut best = limit.min(buf.len());
+    let mut best_rms = f32::MAX;
+    let mut idx = start;
+    while idx + FRAME <= end {
+        let r = compute_rms(&buf[idx..idx + FRAME]);
+        if r < best_rms {
+            best_rms = r;
+            best = idx;
+        }
+        idx += FRAME;
+    }
+    best.max(min_len).min(buf.len())
 }

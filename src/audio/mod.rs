@@ -202,7 +202,7 @@ fn build_stream_f32(
             let mono = downmix_mono(data, channels);
             let level = rms_of(&mono);
             let resampled = if sr != TARGET_SAMPLE_RATE {
-                resample_linear(&mono, sr, TARGET_SAMPLE_RATE)
+                resample_anti_alias(&mono, sr, TARGET_SAMPLE_RATE)
             } else {
                 mono
             };
@@ -246,7 +246,7 @@ fn build_stream_i16(
                 .collect();
             let level = rms_of(&mono);
             let resampled = if sr != TARGET_SAMPLE_RATE {
-                resample_linear(&mono, sr, TARGET_SAMPLE_RATE)
+                resample_anti_alias(&mono, sr, TARGET_SAMPLE_RATE)
             } else {
                 mono
             };
@@ -290,7 +290,7 @@ fn build_stream_i32(
                 .collect();
             let level = rms_of(&mono);
             let resampled = if sr != TARGET_SAMPLE_RATE {
-                resample_linear(&mono, sr, TARGET_SAMPLE_RATE)
+                resample_anti_alias(&mono, sr, TARGET_SAMPLE_RATE)
             } else {
                 mono
             };
@@ -317,24 +317,52 @@ fn downmix_mono(data: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
+/// Downsample with a boxcar low-pass before decimating.
+///
+/// Naive linear interpolation decimates 48 kHz straight to 16 kHz, which folds everything above
+/// 8 kHz back into the band Whisper actually looks at. That aliasing is a real accuracy hit on
+/// music/loopback audio and makes the smallest models invent words. Averaging `ceil(from/to)`
+/// samples per output sample is a cheap boxcar that removes most of it.
+/// Decimate to `to_rate` with a windowed-sinc low-pass.
+///
+/// A short boxcar (the previous implementation) only attenuates the first aliasing lobe, so
+/// anything above roughly 8 kHz folded straight back into the band Whisper analyses. That is a
+/// common source of invented words. A 16-tap Hamming-windowed sinc gives real stop-band
+/// attenuation for a few hundred thousand MACs per second, which is free next to the models.
+fn resample_anti_alias(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
     }
-    let ratio = to_rate as f64 / from_rate as f64;
-    let output_len = (samples.len() as f64 * ratio) as usize;
-    let mut output = Vec::with_capacity(output_len);
-    for i in 0..output_len {
-        let src_pos = i as f64 / ratio;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f64;
-        if idx + 1 < samples.len() {
-            output.push(samples[idx] * (1.0 - frac as f32) + samples[idx + 1] * frac as f32);
-        } else if idx < samples.len() {
-            output.push(samples[idx]);
-        } else {
-            output.push(0.0);
+    const TAPS: usize = 16;
+    let step = from_rate as f64 / to_rate as f64;
+    let cutoff = to_rate as f64 / (2.0 * from_rate as f64);
+    let half = (TAPS / 2) as f64;
+    let out_len = (samples.len() as f64 * (to_rate as f64 / from_rate as f64)) as usize;
+    let mut output = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let center = i as f64 * step;
+        let start = (center - half).max(0.0).round() as usize;
+        let mut acc = 0.0f64;
+        let mut norm = 0.0f64;
+        for k in 0..TAPS {
+            let idx = start + k;
+            if idx >= samples.len() {
+                break;
+            }
+            let x = idx as f64 - center;
+            let z = 2.0 * cutoff * x;
+            let sinc = if z.abs() < 1e-9 {
+                1.0
+            } else {
+                (std::f64::consts::PI * z).sin() / (std::f64::consts::PI * z)
+            };
+            let win = 0.54 - 0.46 * (std::f64::consts::PI * (k as f64 + 0.5) / (TAPS as f64)).cos();
+            let w = sinc * win;
+            acc += w * samples[idx] as f64;
+            norm += w;
         }
+        output.push(if norm.abs() > 1e-12 { (acc / norm) as f32 } else { 0.0 });
     }
     output
 }

@@ -23,6 +23,8 @@ pub struct AudioStats {
     pub transcribe_empty: AtomicU64,
     pub transcribe_errors: AtomicU64,
     pub translations: AtomicU64,
+    /// Captions that reached the translator but came back with no usable output.
+    pub empty_translations: AtomicU64,
 }
 
 impl AudioStats {
@@ -38,6 +40,7 @@ impl AudioStats {
             "transcribe_empty": self.transcribe_empty.load(Ordering::Relaxed),
             "transcribe_errors": self.transcribe_errors.load(Ordering::Relaxed),
             "translations": self.translations.load(Ordering::Relaxed),
+            "empty_translations": self.empty_translations.load(Ordering::Relaxed),
         })
     }
 
@@ -58,10 +61,48 @@ impl AudioStats {
         self.transcribe_empty.store(0, Ordering::Relaxed);
         self.transcribe_errors.store(0, Ordering::Relaxed);
         self.translations.store(0, Ordering::Relaxed);
+        self.empty_translations.store(0, Ordering::Relaxed);
     }
 
     pub fn rms(&self) -> f32 {
         f32::from_bits(self.last_rms.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AppState::start` calls `reset()` on every run, so a counter that is missing from
+    /// `reset()` silently survives restarts and makes `/api/debug/audio` report stale numbers.
+    /// `empty_translations` was exactly that bug once; this asserts every counter the snapshot
+    /// exposes is actually cleared.
+    #[test]
+    fn reset_clears_every_counter_in_the_snapshot() {
+        let stats = AudioStats::default();
+
+        stats.record(160, 0.25);
+        stats.worker_frames.fetch_add(1, Ordering::Relaxed);
+        stats.worker_rms.store(0.5f32.to_bits(), Ordering::Relaxed);
+        stats.chunks_emitted.fetch_add(1, Ordering::Relaxed);
+        stats.transcribe_nonempty.fetch_add(1, Ordering::Relaxed);
+        stats.transcribe_empty.fetch_add(1, Ordering::Relaxed);
+        stats.transcribe_errors.fetch_add(1, Ordering::Relaxed);
+        stats.translations.fetch_add(1, Ordering::Relaxed);
+        stats.empty_translations.fetch_add(1, Ordering::Relaxed);
+
+        // Guard against a new counter being added without its reset line.
+        assert_eq!(stats.snapshot().as_object().unwrap().len(), 11);
+        for (key, value) in stats.snapshot().as_object().unwrap() {
+            assert_ne!(value.as_f64().unwrap_or(0.0), 0.0, "counter {key} is non-zero before reset");
+        }
+
+        stats.reset();
+
+        for (key, value) in stats.snapshot().as_object().unwrap() {
+            assert_eq!(value.as_f64().unwrap_or(0.0), 0.0, "counter {key} survived reset()");
+        }
+        assert_eq!(stats.rms(), 0.0, "rms survived reset()");
     }
 }
 

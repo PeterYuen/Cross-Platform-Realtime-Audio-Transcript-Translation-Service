@@ -1,6 +1,12 @@
 const state = {
     ws: null,
     running: false,
+    applying: false,
+    appliedPending: false,
+    // Last config known to the server. We must build new payloads on top of it: the UI only
+    // exposes three settings, and sending hardcoded values for the rest silently reset them on
+    // every save (it kept clobbering max_chunk_seconds back to 5.0).
+    serverConfig: null,
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -77,6 +83,7 @@ async function hydrateConfig() {
     try {
         const res = await fetch('/api/config');
         const cfg = await res.json();
+        state.serverConfig = cfg;
         const devSel = document.getElementById('audio-device');
         if (cfg.audio_device_name) {
             for (const opt of devSel.options) {
@@ -85,9 +92,57 @@ async function hydrateConfig() {
         }
         if (cfg.target_language) document.getElementById('target-language').value = cfg.target_language;
         if (cfg.whisper_model) document.getElementById('whisper-model').value = cfg.whisper_model;
+        updateApplyVisibility();
     } catch (e) {
         console.error('Failed to load config:', e);
     }
+}
+
+// The three controls that actually need a pipeline restart when they change.
+function currentSelection() {
+    const devSel = document.getElementById('audio-device');
+    const langSel = document.getElementById('target-language');
+    const modelSel = document.getElementById('whisper-model');
+    return {
+        device: devSel.value || null,
+        lang: langSel ? langSel.value : null,
+        model: modelSel ? modelSel.value : null,
+    };
+}
+
+function savedSelection() {
+    const c = state.serverConfig || {};
+    return {
+        device: c.audio_device_name || null,
+        lang: c.target_language || null,
+        model: c.whisper_model || null,
+    };
+}
+
+function isDirty() {
+    return changedParts().length > 0;
+}
+
+/// Which of the three controls differ from what the server has. "lang" is listed separately
+/// because the translator picks it up on the next caption — it needs no restart.
+function changedParts() {
+    const a = currentSelection();
+    const b = savedSelection();
+    const out = [];
+    if (a.device !== b.device) out.push('device');
+    if (a.model !== b.model) out.push('model');
+    if (a.lang !== b.lang) out.push('lang');
+    return out;
+}
+
+// Apply is always available. Hiding it until something looked different was a bad trade: it made
+// the only way to re-run the pipeline impossible without first editing a setting, and "restart to
+// pick up what I already changed" is exactly what the button is for.
+function updateApplyVisibility() {
+    const btn = document.getElementById('btn-apply');
+    if (btn) btn.style.display = '';
+    const hint = document.getElementById('config-hint');
+    if (hint && !isDirty() && /saved|updated/i.test(hint.textContent)) hint.textContent = '';
 }
 
 function buildConfig() {
@@ -96,22 +151,24 @@ function buildConfig() {
     const modelSelect = document.getElementById('whisper-model');
     const selected = deviceSelect.options[deviceSelect.selectedIndex];
     const isLoopback = selected && selected.dataset.loopback === 'true';
-    return {
+    // Start from the server's config and overlay only what the UI actually controls, so fields
+    // like vad_threshold / max_chunk_seconds / model paths survive a save.
+    return Object.assign({}, state.serverConfig || {}, {
         audio_device_name: deviceSelect.value || null,
         audio_device_is_loopback: isLoopback,
         target_language: langSelect.value,
         whisper_model: modelSelect ? modelSelect.value : 'base',
-        server_port: 3000,
-        vad_threshold: 0.003,
-        vad_hangover_frames: 15,
-        max_chunk_seconds: 5.0,
-    };
+    });
 }
 
 function setupButtons() {
     document.getElementById('btn-start').addEventListener('click', startPipeline);
     document.getElementById('btn-stop').addEventListener('click', stopPipeline);
     document.getElementById('btn-apply').addEventListener('click', applyConfig);
+    for (const id of ['audio-device', 'target-language', 'whisper-model']) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', updateApplyVisibility);
+    }
 }
 
 async function startPipeline() {
@@ -128,6 +185,8 @@ async function startPipeline() {
     const res = await fetch('/api/start', { method: 'POST' });
     const body = await res.json().catch(() => ({ ok: res.ok }));
     if (body.ok) {
+        state.serverConfig = buildConfig();
+        updateApplyVisibility();
         clearOutput();
         setRunning(true);
         setStatusText('Loading models…', 'loading');
@@ -139,6 +198,12 @@ async function startPipeline() {
 
 async function applyConfig() {
     hideError();
+    if (state.applying) return;
+    state.applying = true;
+    const started = Date.now();
+    const tick = setInterval(() => {
+        setHint(`Applying settings… ${Math.max(1, Math.round((Date.now() - started) / 1000))}s`);
+    }, 1000);
     try {
         const res = await fetch('/api/config', {
             method: 'POST',
@@ -146,10 +211,61 @@ async function applyConfig() {
             body: JSON.stringify(buildConfig()),
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
-        setHint(state.running ? 'Settings saved — restart to apply' : 'Settings saved');
+        state.serverConfig = buildConfig();
+
+        if (!state.running) {
+            clearInterval(tick);
+            setHint('Saved — press Start to apply', 5000);
+            return;
+        }
+
+        // Apply means restart: stop the running pipeline and start it again so the saved settings
+        // are actually read. Doing it here means the user never has to hunt for Stop/Start.
+        setRunning(false, { busy: true });
+        setStatusText('Restarting…', 'loading');
+        await fetch('/api/stop', { method: 'POST' });
+        if (!await waitForStage('stopped', 8000)) {
+            showError('Saved, but the old pipeline would not stop. Press Stop then Start.');
+            setHint('');
+            setRunning(false);
+            return;
+        }
+        const start = await fetch('/api/start', { method: 'POST' })
+            .then(r => r.json())
+            .catch(() => ({ ok: false }));
+        if (!start.ok) {
+            showError(start.error || 'Settings saved but the pipeline failed to restart');
+            setHint('');
+            setRunning(false);
+            return;
+        }
+        clearOutput();
+        state.appliedPending = true;
+        setRunning(true);
+        setStatusText('Loading models…', 'loading');
+        startStatusPolling();
     } catch (e) {
         showError('Failed to save settings');
+        setRunning(state.running);
+    } finally {
+        clearInterval(tick);
+        state.applying = false;
     }
+}
+
+/// Wait for the server to report a given stage, so we never start on top of a half-torn-down pipeline.
+async function waitForStage(want, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        try {
+            const s = await (await fetch('/api/status')).json();
+            if (s.stage === want) return true;
+        } catch (e) {
+            return false;
+        }
+        await new Promise(r => setTimeout(r, 200));
+    }
+    return false;
 }
 
 let statusTimer = null;
@@ -173,6 +289,13 @@ async function pollStatus() {
         if (s.stage === 'ready') {
             stopStatusPolling();
             setStatusText('Running', 'running');
+            // Retire the "applying" note. If this poll followed an Apply, confirm it landed.
+            if (state.appliedPending) {
+                state.appliedPending = false;
+                setHint('Applied', 3000);
+            } else {
+                setHint('');
+            }
         } else if (s.stage === 'stopped') {
             stopStatusPolling();
             setRunning(false);
@@ -191,14 +314,16 @@ async function stopPipeline() {
     setRunning(false);
 }
 
-function setRunning(running) {
+function setRunning(running, opts) {
     state.running = running;
     if (!running) stopStatusPolling();
-    document.getElementById('btn-start').disabled = running;
-    document.getElementById('btn-stop').disabled = !running;
+    const busy = !!(opts && opts.busy);
+    document.getElementById('btn-start').disabled = running || busy;
+    document.getElementById('btn-stop').disabled = !running || busy;
+    document.getElementById('btn-apply').disabled = busy;
     document.getElementById('status-dot').className = running ? 'dot dot-green' : 'dot dot-red';
     if (running) setStatusText('Running', 'running');
-    else setStatusText('Stopped', 'stopped');
+    else if (!busy) setStatusText('Stopped', 'stopped');
 }
 
 function setStatusText(text, kind) {
@@ -258,16 +383,38 @@ function hideError() {
     banner.textContent = '';
 }
 
-function setHint(text) {
+let hintTimer = null;
+function setHint(text, autoClearMs) {
     const el = document.getElementById('config-hint');
-    if (el) el.textContent = text;
+    if (!el) return;
+    el.textContent = text;
+    if (hintTimer) {
+        clearTimeout(hintTimer);
+        hintTimer = null;
+    }
+    if (text && autoClearMs) {
+        hintTimer = setTimeout(() => {
+            el.textContent = '';
+            hintTimer = null;
+        }, autoClearMs);
+    }
 }
+
+// Level meter state: fast attack, slow release. Without smoothing the bar snaps between frames
+// and reads as frozen whenever the pipeline is busy.
+let levelSmooth = 0;
 
 function updateLevel(rms) {
     const bar = document.getElementById('level-bar');
     const label = document.getElementById('level-value');
     if (!bar || !label) return;
-    const pct = Math.min(100, rms * 100 * 3);
-    bar.style.width = pct.toFixed(1) + '%';
-    label.textContent = rms.toFixed(3);
+    // Map dBFS onto the meter. The old `rms * 300` scale pinned to 100% at normal speech levels,
+    // so during real audio the bar sat glued to the right edge — indistinguishable from a hang.
+    const db = rms > 0 ? 20 * Math.log10(rms) : -80;
+    const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+    levelSmooth = pct > levelSmooth
+        ? Math.max(pct, levelSmooth * 0.6 + pct * 0.4)
+        : levelSmooth * 0.85 + pct * 0.15;
+    bar.style.width = levelSmooth.toFixed(1) + '%';
+    label.textContent = (db < -60 ? '-inf' : db.toFixed(1)) + ' dB';
 }

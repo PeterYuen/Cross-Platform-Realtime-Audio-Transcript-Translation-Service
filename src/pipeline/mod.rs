@@ -1,6 +1,8 @@
 pub mod events;
+pub mod llama_server;
 pub mod stt;
 pub mod translate;
+pub mod whisper_server;
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -122,7 +124,7 @@ async fn run_pipeline_worker(
     };
 
     // Load models
-    let stt = match SttEngine::load(&config.whisper_model).await {
+    let stt = match SttEngine::load(&config.whisper_model, &config.stt).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to load STT model: {}", e);
@@ -134,7 +136,7 @@ async fn run_pipeline_worker(
         }
     };
 
-    let translator = match TranslateEngine::load().await {
+    let translator = match TranslateEngine::load(&config.translation).await {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to load translation model: {}", e);
@@ -156,6 +158,29 @@ async fn run_pipeline_worker(
     // Translation runs on its own task fed by a queue, so a slow generation can never block
     // capture or transcription. The worker only enqueues finished transcripts here.
     let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<(String, String)>();
+
+    // Transcription runs on its own task too. Keeping `stt.transcribe()` inside this loop made
+    // the whole audio path stop for the 20-45 s each call takes: the level bar froze, frames
+    // piled up and were then thrown away. The worker now only segments and enqueues.
+    let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Vec<f32>>();
+    tokio::spawn(run_stt_task(
+        stt,
+        chunk_rx,
+        transcript_tx.clone(),
+        target_language.clone(),
+        event_tx.clone(),
+        alive.clone(),
+        stats.clone(),
+    ));
+
+    // The level bar must tick even while STT or translation are grinding. Emitting it from the
+    // worker's own select meant it went silent whenever the worker was busy inside a model call.
+    tokio::spawn(run_level_ticker(
+        event_tx.clone(),
+        stats.clone(),
+        alive.clone(),
+    ));
+
     tokio::spawn(run_translator_task(
         translator,
         transcript_rx,
@@ -175,6 +200,9 @@ async fn run_pipeline_worker(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_frame = Instant::now();
     let mut frames_in: u64 = 0;
+    let mut last_frames_at = Instant::now();
+    let mut warned_dead = false;
+    let mut ever_had_frames = false;
 
     // If more frames queue up than this, we are falling behind real time; drop the oldest so
     // we always transcribe current audio instead of a stale backlog. ~3 s at ~10 ms/frame.
@@ -208,8 +236,24 @@ async fn run_pipeline_worker(
                 }
             }
             _ = ticker.tick() => {
-                // Heartbeat so the meter proves the stream is alive even during silence.
-                let _ = event_tx.send(PipelineEvent::AudioLevel { rms: stats.rms() });
+                // Watchdog. WASAPI loopback delivers no callbacks while nothing is rendering, so
+                // "no frames lately" is normal during silence — treating that as a fault produced
+                // 16 false alarms in 40 minutes of otherwise healthy audio. Only a stream that has
+                // never produced a single frame is actually broken (wrong or vanished device).
+                if stats.frames.load(Ordering::Relaxed) > 0 {
+                    ever_had_frames = true;
+                    last_frames_at = Instant::now();
+                } else if !ever_had_frames
+                    && last_frames_at.elapsed() > Duration::from_secs(20)
+                    && !warned_dead
+                {
+                    warned_dead = true;
+                    let msg = "Capture produced no audio frames since Start — wrong or vanished "
+                        .to_string()
+                        + "device. Pick another output device and press Start.";
+                    let _ = event_tx.send(PipelineEvent::Error { message: msg.clone() });
+                    error!("{}", msg);
+                }
                 if vad.has_pending() && last_frame.elapsed() >= silence_gap {
                     pending_flush = vad.flush();
                 }
@@ -218,7 +262,7 @@ async fn run_pipeline_worker(
         };
 
         if let Some(chunk) = pending_flush.take() {
-            process_chunk(chunk, &stt, &transcript_tx, &target_language, &event_tx, &stats).await;
+            enqueue_chunk(chunk, &chunk_tx, &event_tx, &stats);
             continue;
         }
 
@@ -245,7 +289,7 @@ async fn run_pipeline_worker(
                         info!("worker received frame #{} (len={}, rms={:.6})", frames_in, frame.len(), rms);
                     }
                     if let Some(chunk) = vad.process_frame(&frame) {
-                        process_chunk(chunk, &stt, &transcript_tx, &target_language, &event_tx, &stats).await;
+                        enqueue_chunk(chunk, &chunk_tx, &event_tx, &stats);
                     }
                 }
             }
@@ -255,6 +299,117 @@ async fn run_pipeline_worker(
 
     // Audio source closed (capture stopped): shut down cleanly.
     mark_dead(&event_tx);
+}
+
+/// Hand a VAD-completed chunk to the transcription task. Never blocks: the audio loop must stay
+/// responsive so the level bar keeps moving and frames keep flowing.
+fn enqueue_chunk(
+    chunk: Vec<f32>,
+    chunk_tx: &mpsc::UnboundedSender<Vec<f32>>,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    stats: &crate::state::AudioStats,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    // Ignore sub-half-second fragments: they are usually VAD noise and transcribe empty.
+    const MIN_CHUNK_SAMPLES: usize = crate::audio::TARGET_SAMPLE_RATE as usize / 2;
+    if chunk.len() < MIN_CHUNK_SAMPLES {
+        info!("worker: skipping short chunk ({} samples)", chunk.len());
+        return;
+    }
+    stats
+        .chunks_emitted
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if chunk_tx.send(chunk).is_err() {
+        let _ = event_tx.send(PipelineEvent::Error {
+            message: "Transcription task is not running".to_string(),
+        });
+    }
+}
+
+/// Transcription task. Kept out of the audio loop so a 20-45 s Whisper call cannot freeze the
+/// meter or throw away audio we already captured.
+async fn run_stt_task(
+    stt: SttEngine,
+    mut rx: mpsc::UnboundedReceiver<Vec<f32>>,
+    transcript_tx: mpsc::UnboundedSender<(String, String)>,
+    target_language: String,
+    event_tx: tokio::sync::broadcast::Sender<PipelineEvent>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    stats: Arc<crate::state::AudioStats>,
+) {
+    loop {
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(first) = rx.recv().await else {
+            break;
+        };
+        // Everything that queued while we were inside a model call gets processed in order.
+        // The old policy kept only the newest chunk and threw the rest away, which is exactly why
+        // continuous speech looked frozen: at ~1.2x real time the backlog grows, every skipped
+        // chunk is speech that never appears, and captions stall and then jump.
+        let mut pending = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            pending.push(next);
+        }
+        let queued_secs: f32 = pending.iter().map(|c| c.len() as f32 / 16000.0).sum();
+        // Process at most this much backlog. Beyond that we are genuinely past catching up, so
+        // drop the oldest and say so loudly instead of silently losing it.
+        const MAX_BACKLOG_SECS: f32 = 25.0;
+        let mut budget = MAX_BACKLOG_SECS;
+        let mut start = 0usize;
+        for (i, c) in pending.iter().enumerate() {
+            budget -= c.len() as f32 / 16000.0;
+            start = i;
+            if budget <= 0.0 {
+                break;
+            }
+        }
+        if start > 0 {
+            warn!(
+                "stt: {:.1}s of audio queued, dropping {:.1}s of oldest backlog",
+                queued_secs,
+                pending[..start].iter().map(|c| c.len() as f32 / 16000.0).sum::<f32>()
+            );
+        } else if pending.len() > 1 {
+            info!(
+                "stt: {:.1}s queued across {} chunks, working through in order",
+                queued_secs,
+                pending.len()
+            );
+        }
+        for chunk in pending.drain(start..) {
+            process_chunk(
+                chunk,
+                &stt,
+                &transcript_tx,
+                &target_language,
+                &event_tx,
+                &stats,
+            )
+            .await;
+        }
+    }
+}
+
+/// Emits the input level on its own timer. Doing it from the worker's select loop made the bar
+/// freeze every time the worker went inside a model call.
+async fn run_level_ticker(
+    event_tx: tokio::sync::broadcast::Sender<PipelineEvent>,
+    stats: Arc<crate::state::AudioStats>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = event_tx.send(PipelineEvent::AudioLevel { rms: stats.rms() });
+    }
 }
 
 async fn process_chunk(
@@ -268,7 +423,6 @@ async fn process_chunk(
     if chunk.is_empty() {
         return;
     }
-    stats.chunks_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Ignore sub-half-second fragments: they are usually VAD noise and transcribe empty.
     const MIN_CHUNK_SAMPLES: usize = crate::audio::TARGET_SAMPLE_RATE as usize / 2;
@@ -278,19 +432,27 @@ async fn process_chunk(
     }
 
     info!("process_chunk: {} samples -> transcribing", chunk.len());
-    match stt.transcribe(&chunk).await {
+    // Segments are forwarded the moment Whisper finishes them, so a 20-second chunk that contains
+    // three sentences reaches the translator three times instead of once at the end.
+    let mut segments = 0usize;
+    let result = stt
+        .transcribe_with(&chunk, |segment| {
+            segments += 1;
+            let _ = event_tx.send(PipelineEvent::Transcript {
+                text: segment.to_string(),
+            });
+            let _ = transcript_tx.send((segment.to_string(), target_language.to_string()));
+        })
+        .await;
+    match result {
         Ok(text) => {
-            if text.trim().is_empty() {
+            if segments == 0 {
                 stats.transcribe_empty.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("transcribe returned empty");
                 return;
             }
             stats.transcribe_nonempty.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!("Transcript: {}", text);
-            let _ = event_tx.send(PipelineEvent::Transcript { text: text.clone() });
-            // Hand off to the translator task; never await it here so capture/transcription
-            // keep running while translation is in flight.
-            let _ = transcript_tx.send((text, target_language.to_string()));
+            let _ = &text; // the joined text already went out segment by segment
         }
         Err(e) => {
             stats.transcribe_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -312,44 +474,99 @@ async fn run_translator_task(
     stats: Arc<crate::state::AudioStats>,
 ) {
     use std::time::Duration;
+    // A transcript whose target language differs from the batch in flight; parked here so it is
+    // not lost while we finish translating the current batch.
+    let mut carry: Option<(String, String)> = None;
     loop {
         if !alive.load(Ordering::Relaxed) {
             break;
         }
-        let item = tokio::select! {
-            i = rx.recv() => i,
-            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+        let item = match carry.take() {
+            Some(v) => Some(v),
+            None => {
+                tokio::select! {
+                    i = rx.recv() => i,
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                }
+            }
         };
         let (text, lang) = match item {
             Some(v) => v,
             None => break,
         };
 
-        let (token_tx, mut token_rx) = mpsc::unbounded_channel::<String>();
-        let etx = event_tx.clone();
-        let broadcast_task = tokio::spawn(async move {
-            while let Some(token) = token_rx.recv().await {
-                let _ = etx.send(PipelineEvent::TranslationToken { token });
-            }
-        });
-
-        match translator.translate_stream(&text, &lang, token_tx).await {
-            Ok(full_text) => {
-                let _ = broadcast_task.await;
-                if full_text.trim().is_empty() {
-                    warn!("Translation produced empty output, skipping");
-                } else {
-                    stats.translations.fetch_add(1, Ordering::Relaxed);
-                    let _ = event_tx.send(PipelineEvent::TranslationComplete { text: full_text });
+        // Drain whatever else is already queued, but translate each item on its own.
+        // Joining them into a single generation used to be worth it (candle cost ~20s of fixed
+        // overhead per call) but llama.cpp answers in ~0.5s, and merging made one bad generation
+        // take four captions down with it.
+        const MAX_DRAINED: usize = 4;
+        let mut batch: Vec<(String, String)> = vec![(text, lang)];
+        while batch.len() < MAX_DRAINED {
+            match rx.try_recv() {
+                Ok((next, next_lang)) => {
+                    if next_lang != batch[0].1 {
+                        carry = Some((next, next_lang));
+                        break;
+                    }
+                    batch.push((next, next_lang));
                 }
+                Err(_) => break,
             }
-            Err(e) => {
-                let _ = broadcast_task.await;
-                error!("Translation error: {}", e);
-                let _ = event_tx.send(PipelineEvent::Error {
-                    message: e.to_string(),
-                });
+        }
+
+        for (text, lang) in batch {
+            let (token_tx, mut token_rx) = mpsc::unbounded_channel::<String>();
+            let etx = event_tx.clone();
+            let broadcast_task = tokio::spawn(async move {
+                while let Some(token) = token_rx.recv().await {
+                    let _ = etx.send(PipelineEvent::TranslationToken { token });
+                }
+            });
+
+            let outcome = match translator.translate_stream(&text, &lang, token_tx).await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Translation error: {}; retrying once", e);
+                    match translator.translate_stream(&text, &lang, mpsc::unbounded_channel().0).await {
+                        Ok(t) => t,
+                        Err(e2) => {
+                            error!("Translation failed twice: {}", e2);
+                            let _ = event_tx.send(PipelineEvent::Error {
+                                message: e2.to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            };
+            let _ = broadcast_task.await;
+            let full_text = outcome.trim().to_string();
+            if full_text.is_empty() {
+                // Empty output is usually the small model stalling on a long or unusual input,
+                // not a genuine "nothing to say". One retry recovers most of those.
+                warn!("Translation produced empty output, retrying once");
+                let again = match translator
+                    .translate_stream(&text, &lang, mpsc::unbounded_channel().0)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("Translation retry failed: {}", e);
+                        stats.empty_translations.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let again = again.trim().to_string();
+                if again.is_empty() {
+                    stats.empty_translations.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                stats.translations.fetch_add(1, Ordering::Relaxed);
+                let _ = event_tx.send(PipelineEvent::TranslationComplete { text: again });
+                continue;
             }
+            stats.translations.fetch_add(1, Ordering::Relaxed);
+            let _ = event_tx.send(PipelineEvent::TranslationComplete { text: full_text });
         }
     }
 }
