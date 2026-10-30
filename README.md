@@ -35,6 +35,9 @@ Open **http://localhost:3000**, pick a loopback output device, choose language +
 then **Start**. First launch downloads models (Whisper GGUFs + the Qwen instruct GGUF) into
 `%APPDATA%\kalosm\cache`; the `HF_HOME` cache set by `main.rs` is `%LOCALAPPDATA%\realtime-translator\models`.
 
+Once built, **double-click `run.cmd`** — it clears stale instances, starts the app, and opens the
+browser. The model servers are children of the app, never started separately.
+
 ### Run it locally
 
 The binary starts either way, but with nothing configured it quietly runs the candle fallback and
