@@ -136,7 +136,7 @@ async fn run_pipeline_worker(
         }
     };
 
-    let translator = match TranslateEngine::load().await {
+    let translator = match TranslateEngine::load(&config.translation).await {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to load translation model: {}", e);
