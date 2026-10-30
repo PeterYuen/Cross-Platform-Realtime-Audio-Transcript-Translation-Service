@@ -21,11 +21,18 @@ if not exist "target\release\realtime-translator.exe" (
     exit /b 1
 )
 
-start "realtime-translator" "target\release\realtime-translator.exe"
+rem Keep one generation of history so the log never grows without bound.
+if exist server_console.log (
+    del /q server_console.log.old 2>nul
+    ren server_console.log server_console.log.old
+)
+
+set RUST_LOG=info
+start "realtime-translator" cmd /c "target\release\realtime-translator.exe >> server_console.log 2>&1"
 
 timeout /t 3 /nobreak >nul
 start "" "http://localhost:3000"
 
-echo Started. The app runs in its own window; play audio and captions appear.
+echo Started. Logs: server_console.log in this folder. Play audio and captions appear.
 echo Stop later with:  taskkill /f /im realtime-translator.exe
 exit /b 0
