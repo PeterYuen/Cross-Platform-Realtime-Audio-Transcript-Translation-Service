@@ -15,13 +15,23 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct WhisperServer {
     child: parking_lot::Mutex<Option<Child>>,
     addr: SocketAddr,
     /// Empty means "let whisper detect it", which costs an extra encoder pass per request.
     language: String,
+    /// Everything needed to launch the server again, held so a dead backend can be revived
+    /// instead of failing every caption for the rest of the session (same design as
+    /// LlamaServer::revive; without it one bad restart leaves the app "ready" but deaf).
+    spec: SpawnSpec,
+}
+
+struct SpawnSpec {
+    bin: PathBuf,
+    model: PathBuf,
+    threads: usize,
 }
 
 impl Drop for WhisperServer {
@@ -41,12 +51,21 @@ impl WhisperServer {
         language: &str,
     ) -> Result<Self> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if Self::ping(addr).await.is_ok() {
+        // Adopting a server we did not start is handy, but it is also how a restart silently
+        // dies: stop() kills its child asynchronously, and if start() arrives before the port
+        // is released it happily adopts the corpse, which then exits and leaves every later
+        // caption failing. Confirm it answers twice, a beat apart, before trusting it.
+        if Self::alive(addr).await {
             info!("stt: reusing whisper-server already listening on {}", addr);
             return Ok(Self {
                 child: parking_lot::Mutex::new(None),
                 addr,
                 language: language.trim().to_string(),
+                spec: SpawnSpec {
+                    bin: PathBuf::new(),
+                    model: PathBuf::new(),
+                    threads,
+                },
             });
         }
 
@@ -58,34 +77,89 @@ impl WhisperServer {
             model_path.display()
         );
 
-        let child = Command::new(&bin)
+        let me = Self {
+            child: parking_lot::Mutex::new(None),
+            addr,
+            language: language.trim().to_string(),
+            spec: SpawnSpec {
+                bin: bin.clone(),
+                model: model_path.clone(),
+                threads,
+            },
+        };
+        me.spawn_child()?;
+        me.wait_until_ready().await?;
+        Ok(me)
+    }
+
+    fn spawn_child(&self) -> Result<()> {
+        let child = Command::new(&self.spec.bin)
             .arg("-m")
-            .arg(&model_path)
+            .arg(&self.spec.model)
             .arg("-t")
-            .arg(threads.to_string())
+            .arg(self.spec.threads.to_string())
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(port.to_string())
+            .arg(self.addr.port().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| anyhow!("failed to launch {}: {}", bin.display(), e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "failed to launch {}: {} (are the MinGW runtime DLLs next to it?)",
+                    self.spec.bin.display(),
+                    e
+                )
+            })?;
+        *self.child.lock() = Some(child);
+        Ok(())
+    }
 
-        let me = Self {
-            child: parking_lot::Mutex::new(Some(child)),
-            addr,
-            language: language.trim().to_string(),
-        };
+    /// Bring the backend back if it died. Without this, one dead server leaves the app
+    /// reporting "ready" while every transcription fails forever.
+    async fn revive(&self) -> Result<()> {
+        if Self::alive(self.addr).await {
+            return Ok(());
+        }
+        warn!("stt: whisper-server is not responding, starting a new one");
+        if let Some(mut old) = self.child.lock().take() {
+            let _ = old.kill();
+        }
+        if self.spec.bin.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "whisper-server died and was adopted (not started by us); \
+                 restart the app to recover"
+            ));
+        }
+        self.spawn_child()?;
+        self.wait_until_ready().await
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
         for _ in 0..120 {
-            if Self::ping(addr).await.is_ok() {
-                info!("stt: whisper-server ready on {}", addr);
-                return Ok(me);
+            if Self::ping(self.addr).await.is_ok() {
+                info!("stt: whisper-server ready on {}", self.addr);
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         Err(anyhow!("whisper-server did not become ready within 60 s"))
+    }
+
+    /// Two healthy probes a beat apart — one immediate yes can be a dying process answering
+    /// its last request before exiting.
+    async fn alive(addr: SocketAddr) -> bool {
+        for probe in 0..2 {
+            if Self::ping(addr).await.is_err() {
+                return false;
+            }
+            if probe == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        true
     }
 
     async fn ping(addr: SocketAddr) -> Result<()> {
@@ -121,9 +195,18 @@ impl WhisperServer {
             body.len()
         );
 
-        let mut stream = TcpStream::connect(self.addr)
-            .await
-            .map_err(|e| anyhow!("cannot reach whisper-server on {}: {}", self.addr, e))?;
+        // Connect through the revive path: a server that died after a restart used to stay
+        // dead for the rest of the session; this makes the next caption fix it.
+        let mut stream = match TcpStream::connect(self.addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("stt: whisper-server unreachable ({}); reviving", e);
+                self.revive().await?;
+                TcpStream::connect(self.addr)
+                    .await
+                    .map_err(|e| anyhow!("cannot reach whisper-server on {}: {}", self.addr, e))?
+            }
+        };
         stream
             .write_all(request.as_bytes())
             .await
