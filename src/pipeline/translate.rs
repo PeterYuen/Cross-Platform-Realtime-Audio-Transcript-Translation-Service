@@ -14,13 +14,6 @@ use crate::pipeline::llama_server::LlamaServer;
 /// turn 1 — but the context window must not be allowed to fill up.
 const SESSION_RECYCLE_TURNS: usize = 8;
 
-/// System prompt for the translator.
-///
-/// Deliberately carries NO worked examples. Measured on Qwen2.5-0.5B, any few-shot example makes
-/// it echo English input back verbatim instead of translating it (tested with one, two and a
-/// Korean example — all three echoed), while the plain instruction translates correctly.
-const SYSTEM_PROMPT: &str = "你是繁體中文翻譯器。無論輸入是哪一種語言（英文、日文、韓文、中文等），\n     都翻譯成繁體中文，只輸出翻譯結果，不要保留原文，不要重複本指令。";
-
 /// Backend actually in use. Kept explicit because the two differ by a factor of ~30 in latency.
 pub struct TranslateEngine {
     backend: Backend,
@@ -447,25 +440,8 @@ fn script_ratio(target_language: &str, text: &str) -> f64 {
 /// True when enough of the output actually uses the target writing system. This is what catches
 /// "우리는만 데이터를... Across that, we are allowed" style code-switching.
 fn language_ok(target_language: &str, text: &str) -> bool {
-    let script = script_of(target_language);
-    let mut letters = 0usize;
-    let mut in_script = 0usize;
-    for c in text.chars() {
-        if c.is_whitespace() || c.is_ascii_digit() || c.is_ascii_punctuation() {
-            continue;
-        }
-        if c.is_alphabetic() || is_in_script(c, script) {
-            letters += 1;
-            if is_in_script(c, script) {
-                in_script += 1;
-            }
-        }
-    }
-    if letters == 0 {
-        return false;
-    }
     // 0.7, not 0.95. Korean keeps "ID", "FTE" and "chunk" in Latin letters, and demanding 95%
-    // Hangul labelled perfectly good captions as wrong-language — which made every other caption
+    // Hangul labelled perfectly good captions as wrong-language - which made every other caption
     // get translated twice and doubled end-to-end latency.
     script_ratio(target_language, text) >= 0.7
 }

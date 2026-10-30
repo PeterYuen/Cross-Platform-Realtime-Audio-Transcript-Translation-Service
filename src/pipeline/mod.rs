@@ -490,7 +490,7 @@ async fn run_translator_task(
                 }
             }
         };
-        let (mut text, lang) = match item {
+        let (text, lang) = match item {
             Some(v) => v,
             None => break,
         };
